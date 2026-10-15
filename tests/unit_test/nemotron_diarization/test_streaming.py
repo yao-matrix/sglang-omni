@@ -9,12 +9,14 @@ import torch
 
 from sglang_omni.client.types import DiarizationOperation, DiarizationResult
 from sglang_omni.models.nemotron_diarization import streaming
+from sglang_omni.models.nemotron_diarization.backend import SAMPLE_RATE
 from sglang_omni.models.nemotron_diarization.model import Preprocessor
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 from sglang_omni.models.nemotron_diarization.streaming import (
     LiveDiarization,
     LiveSessions,
 )
+from tests.unit_test.fixtures.accelerator import require_device_streams
 
 CHUNK_FRAMES = 72
 WINDOW_FRAMES = 104
@@ -95,6 +97,37 @@ def test_incremental_features_match_complete_audio_and_flush_partial_tail(
         )
     with pytest.raises(ValueError, match="finished"):
         live.probabilities(np.zeros(160, np.float32))
+
+
+@pytest.mark.accelerator
+def test_live_windows_on_a_worker_stream_match_complete_audio() -> None:
+    device = require_device_streams()
+    device_module = torch.get_device_module(device)
+    model = AcousticProbe()
+    model.preprocessor.to(device)
+    audio = np.random.default_rng(17).normal(size=50003).astype(np.float32)
+    expected, frame_count = model.preprocessor(torch.from_numpy(audio).to(device)[None])
+    expected = expected[:, :, :frame_count]
+    live = LiveDiarization(model, device=device)
+    stream = device_module.Stream(device)
+    stream.wait_stream(device_module.current_stream(device))
+    with device_module.stream(stream):
+        outputs = [
+            live.probabilities(audio[offset : offset + SAMPLE_RATE])
+            for offset in range(0, len(audio), SAMPLE_RATE)
+        ]
+        outputs.append(live.probabilities(np.empty(0, np.float32), final=True))
+    stream.synchronize()
+    assert torch.cat(outputs, dim=1).shape == (1, frame_count, 8)
+    assert model.chunks
+    for index, chunk in enumerate(model.chunks):
+        start_frame = index * CHUNK_FRAMES
+        torch.testing.assert_close(
+            chunk,
+            expected[:, :, start_frame : start_frame + WINDOW_FRAMES],
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 def test_equal_threshold_preserves_activity_across_updates(
