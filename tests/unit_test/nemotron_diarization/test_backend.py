@@ -15,13 +15,18 @@ from torch._inductor import config as inductor_config
 
 from sglang_omni.models.nemotron_diarization import model
 from sglang_omni.models.nemotron_diarization.backend import (
+    PROFILES,
     REQUIRED_CONFIG,
     load_checkpoint_weights,
     probabilities_to_segments,
     resolve_nemo_checkpoint,
     validate_checkpoint,
 )
-from sglang_omni.models.nemotron_diarization.model import TransformerEncoder
+from sglang_omni.models.nemotron_diarization.model import (
+    RotaryEmbedding,
+    TransformerEncoder,
+)
+from tests.unit_test.fixtures.accelerator import require_device_streams
 
 
 def write_archive(
@@ -145,6 +150,32 @@ def test_reused_attention_masks_preserve_each_valid_length() -> None:
         mask = encoder.attention_mask(9, valid_length)
         actual = mask.mask_mod(0, 0, 0, positions)
         torch.testing.assert_close(actual, positions < valid_length)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize(
+    "frames",
+    [9, sum(PROFILES["low_latency"][:4]), sum(PROFILES["offline"][:4])],
+)
+def test_rotary_kernel_matches_unfused_fp32_rotation_on_device(frames: int) -> None:
+    device = require_device_streams()
+    rotary = RotaryEmbedding(max_frames=sum(PROFILES["offline"][:4])).to(device)
+    generator = torch.Generator(device="cpu").manual_seed(frames)
+    qkv = (
+        torch.randn(1, frames, 3, 8, 64, generator=generator)
+        .to(device)
+        .permute(2, 0, 3, 1, 4)
+    )
+    q, k, _ = qkv.unbind(0)
+    assert not q.is_contiguous() and not k.is_contiguous()
+    cos, sin = rotary.cos[:frames], rotary.sin[:frames]
+    expected = [
+        x * cos + torch.cat([-x[..., 32:], x[..., :32]], dim=-1) * sin for x in (q, k)
+    ]
+    actual = rotary(q, k)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        assert actual_tensor.device == device
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("deterministic", [False, True])

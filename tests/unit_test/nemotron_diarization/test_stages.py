@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Guard decoding, device placement, admission, and GPU settlement."""
+"""Guard decoding, device placement, admission, and device stream settlement."""
 
 import io
 import threading
@@ -17,26 +17,37 @@ import sglang_omni.platforms as platforms
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client.client import Client
 from sglang_omni.client.types import GenerateRequest
-from sglang_omni.models.nemotron_diarization import stages
+from sglang_omni.models.nemotron_diarization import backend, stages
 from sglang_omni.models.nemotron_diarization.backend import load_diarization_model
 from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationModel
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.step_scheduler import StepResult, StepScheduler, TaskBuilder
+from tests.unit_test.fixtures.accelerator import require_device_streams
+
+
+def fake_platform(device_type: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        device_type=device_type, supports_torchaudio_resample=lambda: True
+    )
 
 
 @pytest.fixture(autouse=True)
 def cuda_platform(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        platforms,
-        "current_platform",
-        SimpleNamespace(device_type="cuda", supports_torchaudio_resample=lambda: True),
+    monkeypatch.setattr(platforms, "current_platform", fake_platform("cuda"))
+    device_module = torch.get_device_module
+    settled_streams = SimpleNamespace(
+        current_stream=lambda device: SimpleNamespace(synchronize=lambda: None)
     )
     monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda device: SimpleNamespace(synchronize=lambda: None),
+        torch,
+        "get_device_module",
+        lambda device: (
+            settled_streams
+            if torch.device(device).type == "cpu"
+            else device_module(device)
+        ),
     )
 
 
@@ -155,18 +166,35 @@ def test_unsupported_deployments_fail_before_loading(
 ) -> None:
     devices = []
 
+    def resolve(model_path: str) -> NoReturn:
+        raise AssertionError("resolved a checkpoint for an unsupported deployment")
+
     def load(
         model_path: str, *, device: torch.device, profile: str
     ) -> NemotronDiarizationModel:
         devices.append(device)
         raise LookupError("loaded")
 
+    monkeypatch.setattr(backend, "resolve_nemo_checkpoint", resolve)
     for device, profile, message in [
-        (torch.device("cpu"), "offline", "CUDA device"),
+        (torch.device("cpu"), "offline", "accelerator device"),
         (torch.device("cuda:0"), "live", "Unknown diarization profile"),
     ]:
         with pytest.raises(ValueError, match=message):
             load_diarization_model("missing/repository", device=device, profile=profile)
+    for device, platform_type in [("cpu", "cuda"), (None, "cpu")]:
+        monkeypatch.setattr(platforms, "current_platform", fake_platform(platform_type))
+        with pytest.raises(ValueError, match="accelerator device"):
+            stages.create_diarization_executor(
+                "missing/repository",
+                device=device,
+                profile="offline",
+                max_concurrency=1,
+                max_live_sessions=8,
+                max_running_requests=16,
+                max_queued_requests=64,
+            )
+    monkeypatch.setattr(platforms, "current_platform", fake_platform("cuda"))
     monkeypatch.setattr(stages, "load_diarization_model", load)
     for concurrency in [0, True]:
         with pytest.raises(ValueError, match="max_concurrency must be a positive"):
@@ -194,7 +222,7 @@ def test_unsupported_deployments_fail_before_loading(
     assert devices == [torch.device("cuda:3")]
 
 
-def test_failed_inference_waits_for_gpu_before_propagating_error(
+def test_failed_inference_waits_for_device_before_propagating_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     launched, waiting, finished = (
@@ -204,7 +232,7 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
     )
 
     class Stream:
-        def wait_event(self, event: torch.cuda.Event) -> None:
+        def wait_event(self, event: SimpleNamespace) -> None:
             pass
 
         def synchronize(self) -> None:
@@ -215,13 +243,15 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
     class FailingModel(RecordingModel):
         def preprocessor(self, signal: torch.Tensor) -> NoReturn:
             launched.set()
-            raise RuntimeError("inference failed after launching GPU work")
+            raise RuntimeError("inference failed after launching device work")
 
-    monkeypatch.setattr(
-        torch.cuda, "Event", lambda: SimpleNamespace(record=lambda stream: None)
+    device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(record=lambda stream: None),
+        current_stream=lambda device: None,
+        Stream=lambda device: Stream(),
+        stream=lambda stream: nullcontext(),
     )
-    monkeypatch.setattr(torch.cuda, "Stream", lambda device: Stream())
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch, "get_device_module", lambda device: device_module)
     worker = stages.DiarizationWorker(FailingModel(), torch.device("cpu"), 2, 1)
     errors: list[RuntimeError] = []
 
@@ -240,6 +270,35 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
         finished.set()
         thread.join(timeout=5)
     assert "inference failed" in str(errors[0])
+
+
+@pytest.mark.accelerator
+def test_worker_threads_read_loaded_weights_on_their_own_device_streams() -> None:
+    device = require_device_streams()
+    device_module = torch.get_device_module(device)
+    weights = torch.arange(1 << 20, dtype=torch.float32, device=device)
+    worker = stages.DiarizationWorker(RecordingModel(), device, 2, 1)
+    default_stream = device_module.current_stream(device)
+    streams: dict[int, torch.Stream] = {}
+    results: dict[int, torch.Tensor] = {}
+    both_entered = threading.Barrier(2)
+
+    def run(scale: int) -> None:
+        with worker.compute_context():
+            streams[scale] = device_module.current_stream(device)
+            both_entered.wait(timeout=5)
+            results[scale] = weights * scale
+
+    threads = [threading.Thread(target=run, args=(scale,)) for scale in (2, 3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert sorted(results) == [2, 3]
+    assert streams[2] != streams[3]
+    assert default_stream not in streams.values()
+    for scale, result in results.items():
+        torch.testing.assert_close(result, weights * scale, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

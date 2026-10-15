@@ -4,7 +4,9 @@
 
 ## Launch
 
-The server runs on one NVIDIA GPU and needs FFmpeg for compressed audio. It downloads only `config.json` and the `.nemo` archive from the repository and computes in FP32.
+The server runs on one accelerator and needs FFmpeg for compressed audio. It downloads only `config.json` and the `.nemo` archive from the repository and computes in FP32.
+
+For Intel GPU (XPU) serving, see the [XPU recipe](../get_started/installation_xpu.md#nemotron-3-diarization-speaker-diarization-single-xpu).
 
 ```bash
 sgl-omni serve --model-path nvidia/Nemotron-3-Diarization --port 8000
@@ -69,7 +71,7 @@ The server advances each recording one chunk at a time. A new recording or live 
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_concurrency` | `1` | Chunks that run at once, each on its own CUDA stream. It does not batch recordings. |
+| `max_concurrency` | `1` | Chunks that run at once, each on its own device stream. It does not batch recordings. |
 | `max_running_requests` | `16` | Recordings and live operations that hold model state at once. Each upload keeps its features until it finishes. |
 | `max_queued_requests` | `64` | Additional uploads or new live sessions that wait. Beyond this, uploads receive HTTP 503 and new live sessions receive an `error` event. |
 | `max_live_sessions` | `8` | Open live sessions. Audio and control events of an open session are never rejected, but they wait while all running slots are busy. |

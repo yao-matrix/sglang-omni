@@ -189,8 +189,8 @@ def load_diarization_model(
         raise ValueError(
             f"Unknown diarization profile {profile!r}, use one of {list(PROFILES)}"
         )
-    elif device.type != "cuda":
-        raise ValueError("Nemotron 3 diarization requires an NVIDIA CUDA device")
+    elif device.type == "cpu":
+        raise ValueError("Nemotron 3 diarization requires an accelerator device")
     else:
         pass
     checkpoint = resolve_nemo_checkpoint(model_path)
